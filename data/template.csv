@@ -1,0 +1,4 @@
+candidate_id,name,docs_glob,notes,scholar_query,institution,pe_areas
+cand_001,Dr. Alice Rossi,data/candidates/cand_001/**/*,"Materiali, simulazioni DFT, elettronica dello stato solido","Alice Rossi DFT materials","Politecnico di Milano","PE4;PE5"
+cand_002,Prof. Marco Verdi,data/candidates/cand_002/**/*,"Catalisi computazionale, surface science","Marco Verdi computational catalysis","Universita di Bologna","PE5"
+cand_003,Dr. Elena Bianchi,data/candidates/cand_003/**/*,"Metodi numerici, HPC, parallelizzazione","Elena Bianchi HPC simulations","Universita di Padova","PE6;PE7"
