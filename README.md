@@ -4,7 +4,7 @@ Strumento per selezionare il referee scientifico ottimale da una lista di candid
 - articoli scientifici dei candidati
 - documenti interni del progetto
 
-Il modello usa TF-IDF + cosine similarity su tutto il corpus documentale.
+Il modello usa similarita' semantica ibrida (lessicale + embeddings scientifici) sul corpus documentale.
 Default lingua analisi: inglese (`--language en`).
 
 ## Policy backup del repo
@@ -33,10 +33,12 @@ python src/online_referee_matcher.py --candidates-csv ./data/candidates_latest.c
 ```
 
 Caratteristiche:
-- analizza l'attivita' scientifica dei candidati via sorgenti multiple (OpenAlex + Semantic Scholar)
+- analizza il contenuto scientifico dei candidati via sorgenti multiple (OpenAlex + Semantic Scholar)
 - applica il filtro PE all'inizio della pipeline (prima di qualsiasi chiamata API)
 - analizza solo candidati con almeno una PE in comune col progetto (PE inferite automaticamente dal testo progetto)
-- assegna un vantaggio ai candidati con piu' PE in comune (`pe_overlap_score`)
+- espande automaticamente i termini scientifici (sinonimi/concetti correlati) per migliorare il matching di sotto-argomenti
+- legge tutti i titoli disponibili e seleziona i lavori piu' affini all'argomento del progetto
+- supporta embeddings scientifici (`sentence-transformers`, default modello `allenai-specter`) con fallback lessicale
 - non richiede alcun parametro PE da CLI
 - legge in automatico sia schema canonico sia schema `candidates_latest` (`Referee ID`, `Nome`, `Cognome`, `Panel ID1..5`)
 - non salva pubblicazioni su disco
@@ -51,8 +53,9 @@ Note:
 - puoi fornire `openalex_author_id` nel CSV per evitare errori di disambiguazione autore
 - puoi usare `--sources` per selezionare le sorgenti (`openalex`, `semanticscholar`)
 - per Semantic Scholar puoi passare `--s2-api-key` oppure usare la variabile ambiente `S2_API_KEY`
-- puoi regolare il peso del match multi-PE con `--pe-overlap-weight` (default `0.03`)
-- il peso PE overlap viene automaticamente limitato per restare molto inferiore al peso attivita' (`activity_weight`)
+- il ranking finale e' guidato solo dal punteggio di affinita' scientifica (`ml_score`)
+- puoi configurare embeddings con `--embedding-model` (default `allenai-specter`)
+- puoi bilanciare matching lessicale/embedding con `--embedding-weight` (default `0.60`)
 - default `--max-works` e' `100` per sorgente/candidato
 - full scan solo esplicito con `--full-scan`
 - il log runtime riporta quale candidato e' in analisi e lo stato di completamento

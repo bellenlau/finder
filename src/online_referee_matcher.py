@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 import time
@@ -30,6 +29,22 @@ OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
 SEMANTIC_SCHOLAR_AUTHOR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/author/search"
 SEMANTIC_SCHOLAR_AUTHOR_PAPERS_URL_TMPL = "https://api.semanticscholar.org/graph/v1/author/{author_id}/papers"
+
+RETRYABLE_STATUS_CODES = {429, 439, 500, 502, 503, 504}
+DEFAULT_MAX_RETRIES = 6
+DEFAULT_BACKOFF_SECONDS = 2.0
+
+SCIENTIFIC_TERM_EXPANSIONS: list[tuple[str, str]] = [
+    (r"\bdft\b", "density functional theory first principles electronic structure"),
+    (r"\bab\s*initio\b", "first principles quantum mechanical simulation"),
+    (r"\bhpc\b", "high performance computing parallel computing distributed computing"),
+    (r"\bmd\b", "molecular dynamics atomistic simulation"),
+    (r"\bcatalys(is|i|tic)\b", "reaction mechanism active site surface chemistry"),
+    (r"\bsurface science\b", "interfaces adsorption heterogeneous catalysis"),
+    (r"\belectronic structure\b", "band structure density of states"),
+    (r"\bvibrational\b", "phonon lattice dynamics infrared raman"),
+    (r"\bmaterials\b", "condensed matter solid state"),
+]
 
 
 ITALIAN_STOPWORDS = {
@@ -105,21 +120,6 @@ class OnlineCandidate:
 
 
 @dataclass
-class OnlineCandidateResult:
-    candidate: OnlineCandidate
-    ml_score: float
-    activity_score: float
-    final_score: float
-    documents_used: int
-    works_total: int
-    citations_total: int
-    h_index: int | None
-    is_conflict: bool
-    conflict_reasons: str
-    eligible: bool
-
-
-@dataclass
 class MinimalConflictProfile:
     candidate_id: str
     name: str
@@ -130,6 +130,96 @@ class MinimalConflictProfile:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def short_log_text(text: str, max_len: int = 120) -> str:
+    cleaned = normalize_text(text)
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3] + "..."
+
+
+def expand_scientific_terms(text: str) -> str:
+    base = normalize_text(text)
+    if not base:
+        return ""
+
+    lower = base.lower()
+    additions: list[str] = []
+    for pattern, expansion in SCIENTIFIC_TERM_EXPANSIONS:
+        if re.search(pattern, lower):
+            additions.append(expansion)
+
+    if not additions:
+        return base
+    return normalize_text(f"{base} {' '.join(additions)}")
+
+
+def load_embedding_model(model_name: str) -> Any | None:
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print(
+            "[WARN] sentence-transformers not installed: using lexical similarity only. "
+            "Install dependencies from requirements.txt to enable scientific embeddings."
+        )
+        return None
+
+    try:
+        print(f"[INFO] Loading scientific embedding model: {model_name}")
+        return SentenceTransformer(model_name)
+    except Exception as exc:
+        print(
+            "[WARN] Unable to load embedding model; using lexical similarity only. "
+            f"Reason: {exc}"
+        )
+        return None
+
+
+@dataclass
+class SimilarityScorer:
+    vectorizer: HashingVectorizer
+    project_text: str
+    project_vec: csr_matrix
+    embedding_model: Any | None
+    lexical_weight: float
+    embedding_weight: float
+
+    def __post_init__(self) -> None:
+        self._embedding_cache: dict[str, np.ndarray] = {}
+        self.project_embedding = self.embedding_similarity(self.project_text)
+
+    def lexical_similarity(self, text: str) -> float:
+        prepared = expand_scientific_terms(text)
+        if not prepared:
+            return 0.0
+        vec = self.vectorizer.transform([prepared])
+        vec = normalize(vec, norm="l2")
+        return float(cosine_similarity(vec, self.project_vec)[0, 0])
+
+    def embedding_similarity(self, text: str) -> float | None:
+        prepared = expand_scientific_terms(text)
+        if not prepared or self.embedding_model is None:
+            return None
+
+        if prepared not in self._embedding_cache:
+            emb = self.embedding_model.encode(prepared, normalize_embeddings=True)
+            self._embedding_cache[prepared] = np.asarray(emb, dtype=float)
+
+        current = self._embedding_cache[prepared]
+        if self.project_text not in self._embedding_cache:
+            emb_proj = self.embedding_model.encode(self.project_text, normalize_embeddings=True)
+            self._embedding_cache[self.project_text] = np.asarray(emb_proj, dtype=float)
+
+        project_emb = self._embedding_cache[self.project_text]
+        return float(np.dot(current, project_emb))
+
+    def combined_similarity(self, text: str) -> float:
+        lexical = self.lexical_similarity(text)
+        semantic = self.embedding_similarity(text)
+        if semantic is None:
+            return lexical
+        return self.lexical_weight * lexical + self.embedding_weight * semantic
 
 
 def normalize_pe_value(value: str) -> str:
@@ -233,13 +323,64 @@ def load_online_candidates(candidates_csv: Path, project_pes: set[str]) -> list[
     return out
 
 
+def parse_retry_after_seconds(raw_value: str) -> float:
+    value = (raw_value or "").strip()
+    if not value:
+        return 0.0
+    if value.replace(".", "", 1).isdigit():
+        return max(0.0, float(value))
+    return 0.0
+
+
+def request_with_retries(
+    *,
+    url: str,
+    params: dict[str, Any],
+    headers: dict[str, str] | None,
+    timeout: int,
+    source_name: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        response = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
+
+        if response.status_code not in RETRYABLE_STATUS_CODES:
+            response.raise_for_status()
+            return response.json()
+
+        retry_after = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+        wait_seconds = retry_after if retry_after > 0 else backoff_seconds * (2**attempt)
+        last_error = requests.HTTPError(
+            (
+                f"{source_name} transient error ({response.status_code}), "
+                f"attempt {attempt + 1}/{max_retries + 1}"
+            ),
+            response=response,
+        )
+
+        if attempt < max_retries:
+            print(f"[WARN] {source_name} HTTP {response.status_code}, retry in {wait_seconds:.1f}s")
+            time.sleep(wait_seconds)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{source_name} request failed unexpectedly")
+
+
 def request_json(url: str, params: dict[str, Any], mailto: str, timeout: int = 45) -> dict[str, Any]:
     request_params = dict(params)
     if mailto.strip():
         request_params["mailto"] = mailto.strip()
-    response = requests.get(url, params=request_params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    return request_with_retries(
+        url=url,
+        params=request_params,
+        headers=None,
+        timeout=timeout,
+        source_name="OpenAlex",
+    )
 
 
 def request_semantic_scholar_json(
@@ -251,31 +392,13 @@ def request_semantic_scholar_json(
     headers: dict[str, str] = {}
     if api_key.strip():
         headers["x-api-key"] = api_key.strip()
-
-    max_retries = 4
-    backoff_seconds = 1.5
-    last_error: Exception | None = None
-
-    for attempt in range(max_retries + 1):
-        response = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if response.status_code != 429:
-            response.raise_for_status()
-            return response.json()
-
-        retry_after_raw = response.headers.get("Retry-After", "").strip()
-        retry_after = float(retry_after_raw) if retry_after_raw.replace(".", "", 1).isdigit() else 0.0
-        wait_seconds = retry_after if retry_after > 0 else backoff_seconds * (2**attempt)
-        last_error = requests.HTTPError(
-            f"Semantic Scholar rate-limited (429), attempt {attempt + 1}/{max_retries + 1}",
-            response=response,
-        )
-        if attempt < max_retries:
-            print(f"[WARN] Semantic Scholar 429, retry in {wait_seconds:.1f}s")
-            time.sleep(wait_seconds)
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Semantic Scholar request failed unexpectedly")
+    return request_with_retries(
+        url=url,
+        params=params,
+        headers=headers,
+        timeout=timeout,
+        source_name="Semantic Scholar",
+    )
 
 
 def resolve_openalex_author_id(candidate: OnlineCandidate, mailto: str) -> tuple[str, str, int | None]:
@@ -372,19 +495,17 @@ def stream_openalex_works(
     author_id: str,
     candidate_name: str,
     vectorizer: HashingVectorizer,
+    scorer: SimilarityScorer,
     mailto: str,
     from_year: int | None,
     max_works: int | None,
     sleep_seconds: float,
-) -> tuple[csr_matrix, int, int, set[str], int]:
+) -> tuple[csr_matrix, int, int, set[str], int, list[str]]:
     cursor = "*"
     per_page = 200
 
-    aggregate_vec: csr_matrix | None = None
-    works_total = 0
-    citations_total = 0
-    coauthors: set[str] = set()
-    docs_used = 0
+    scanned_count = 0
+    available_works: list[dict[str, Any]] = []
 
     while True:
         params: dict[str, Any] = {
@@ -402,30 +523,35 @@ def stream_openalex_works(
 
         for work in results:
             title = normalize_text(str(work.get("title", "")))
+            year = work.get("publication_year")
             abstract = restore_abstract(work.get("abstract_inverted_index"))
-            text = normalize_text(f"{title} {abstract}")
 
-            if text:
-                vec = vectorizer.transform([text])
-                aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
-                docs_used += 1
+            next_idx = scanned_count + 1
+            title_for_log = short_log_text(title or "(untitled)")
+            year_for_log = str(year) if isinstance(year, int) else "n/a"
+            print(
+                f"[INFO] OpenAlex work {next_idx} for {candidate_name} ({year_for_log}): {title_for_log}"
+            )
 
-            works_total += 1
-            citations_total += int(work.get("cited_by_count", 0) or 0)
-
+            coauthors_current: set[str] = set()
             for auth in work.get("authorships", []):
                 display_name = str((auth.get("author") or {}).get("display_name", "")).strip()
                 if not display_name:
                     continue
                 if candidate_name_match_score(candidate_name, display_name) >= 0.8:
                     continue
-                coauthors.add(display_name)
+                coauthors_current.add(display_name)
 
-            if max_works is not None and works_total >= max_works:
-                break
-
-        if max_works is not None and works_total >= max_works:
-            break
+            available_works.append(
+                {
+                    "title": title,
+                    "abstract": abstract,
+                    "year": year,
+                    "citations": int(work.get("cited_by_count", 0) or 0),
+                    "coauthors": coauthors_current,
+                }
+            )
+            scanned_count += 1
 
         meta = payload.get("meta") or {}
         next_cursor = str(meta.get("next_cursor", "") or "").strip()
@@ -436,29 +562,66 @@ def stream_openalex_works(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-    if aggregate_vec is None:
-        aggregate_vec = vectorizer.transform([""])
+    scored_works: list[tuple[float, dict[str, Any]]] = []
+    for item in available_works:
+        score = scorer.combined_similarity(str(item.get("title", "")))
+        scored_works.append((score, item))
 
-    return aggregate_vec, works_total, citations_total, coauthors, docs_used
-
-
-def stream_semantic_scholar_papers(
-    author_id: str,
-    candidate_name: str,
-    vectorizer: HashingVectorizer,
-    s2_api_key: str,
-    from_year: int | None,
-    max_works: int | None,
-    sleep_seconds: float,
-) -> tuple[csr_matrix, int, int, set[str], int]:
-    limit = 100
-    offset = 0
+    scored_works.sort(key=lambda x: x[0], reverse=True)
+    selected = scored_works if max_works is None else scored_works[:max_works]
 
     aggregate_vec: csr_matrix | None = None
     works_total = 0
     citations_total = 0
     coauthors: set[str] = set()
     docs_used = 0
+    selected_texts: list[str] = []
+
+    for rank, (score, item) in enumerate(selected, start=1):
+        year = item.get("year")
+        year_for_log = str(year) if isinstance(year, int) else "n/a"
+        title_for_log = short_log_text(str(item.get("title", "") or "(untitled)"))
+        print(
+            f"[INFO] OpenAlex selected {rank}/{len(selected)} for {candidate_name} "
+            f"(affinity={score:.4f}, year={year_for_log}): {title_for_log}"
+        )
+
+        text = expand_scientific_terms(f"{item.get('title', '')} {item.get('abstract', '')}")
+        if text:
+            vec = vectorizer.transform([text])
+            aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
+            docs_used += 1
+            selected_texts.append(text)
+
+        works_total += 1
+        citations_total += int(item.get("citations", 0) or 0)
+        coauthors.update(set(item.get("coauthors", set())))
+
+    if aggregate_vec is None:
+        aggregate_vec = vectorizer.transform([""])
+
+    print(
+        f"[INFO] OpenAlex scanned {scanned_count} works for {candidate_name}, "
+        f"selected {works_total} by title affinity"
+    )
+    return aggregate_vec, works_total, citations_total, coauthors, docs_used, selected_texts
+
+
+def stream_semantic_scholar_papers(
+    author_id: str,
+    candidate_name: str,
+    vectorizer: HashingVectorizer,
+    scorer: SimilarityScorer,
+    s2_api_key: str,
+    from_year: int | None,
+    max_works: int | None,
+    sleep_seconds: float,
+) -> tuple[csr_matrix, int, int, set[str], int, list[str]]:
+    limit = 100
+    offset = 0
+
+    scanned_count = 0
+    available_works: list[dict[str, Any]] = []
 
     while True:
         params: dict[str, Any] = {
@@ -479,28 +642,33 @@ def stream_semantic_scholar_papers(
 
             title = normalize_text(str(item.get("title", "")))
             abstract = normalize_text(str(item.get("abstract", "")))
-            text = normalize_text(f"{title} {abstract}")
-            if text:
-                vec = vectorizer.transform([text])
-                aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
-                docs_used += 1
 
-            works_total += 1
-            citations_total += int(item.get("citationCount", 0) or 0)
+            next_idx = scanned_count + 1
+            title_for_log = short_log_text(title or "(untitled)")
+            year_for_log = str(year) if isinstance(year, int) else "n/a"
+            print(
+                f"[INFO] Semantic Scholar work {next_idx} for {candidate_name} ({year_for_log}): {title_for_log}"
+            )
 
+            coauthors_current: set[str] = set()
             for author in item.get("authors", []):
                 display_name = str(author.get("name", "") or "").strip()
                 if not display_name:
                     continue
                 if candidate_name_match_score(candidate_name, display_name) >= 0.8:
                     continue
-                coauthors.add(display_name)
+                coauthors_current.add(display_name)
 
-            if max_works is not None and works_total >= max_works:
-                break
-
-        if max_works is not None and works_total >= max_works:
-            break
+            available_works.append(
+                {
+                    "title": title,
+                    "abstract": abstract,
+                    "year": year,
+                    "citations": int(item.get("citationCount", 0) or 0),
+                    "coauthors": coauthors_current,
+                }
+            )
+            scanned_count += 1
 
         if len(data) < limit:
             break
@@ -509,17 +677,49 @@ def stream_semantic_scholar_papers(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
+    scored_works: list[tuple[float, dict[str, Any]]] = []
+    for item in available_works:
+        score = scorer.combined_similarity(str(item.get("title", "")))
+        scored_works.append((score, item))
+
+    scored_works.sort(key=lambda x: x[0], reverse=True)
+    selected = scored_works if max_works is None else scored_works[:max_works]
+
+    aggregate_vec: csr_matrix | None = None
+    works_total = 0
+    citations_total = 0
+    coauthors: set[str] = set()
+    docs_used = 0
+    selected_texts: list[str] = []
+
+    for rank, (score, item) in enumerate(selected, start=1):
+        year = item.get("year")
+        year_for_log = str(year) if isinstance(year, int) else "n/a"
+        title_for_log = short_log_text(str(item.get("title", "") or "(untitled)"))
+        print(
+            f"[INFO] Semantic Scholar selected {rank}/{len(selected)} for {candidate_name} "
+            f"(affinity={score:.4f}, year={year_for_log}): {title_for_log}"
+        )
+
+        text = expand_scientific_terms(f"{item.get('title', '')} {item.get('abstract', '')}")
+        if text:
+            vec = vectorizer.transform([text])
+            aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
+            docs_used += 1
+            selected_texts.append(text)
+
+        works_total += 1
+        citations_total += int(item.get("citations", 0) or 0)
+        coauthors.update(set(item.get("coauthors", set())))
+
     if aggregate_vec is None:
         aggregate_vec = vectorizer.transform([""])
 
-    return aggregate_vec, works_total, citations_total, coauthors, docs_used
-
-
-def compute_activity_score(works_total: int, citations_total: int, h_index: int | None) -> float:
-    works_part = math.log1p(max(0, works_total))
-    citations_part = math.log1p(max(0, citations_total))
-    h_part = math.log1p(max(0, h_index or 0))
-    return 0.35 * works_part + 0.45 * citations_part + 0.20 * h_part
+    print(
+        f"[INFO] Semantic Scholar scanned {scanned_count} works for {candidate_name}, "
+        f"selected {works_total} by title affinity"
+    )
+    return aggregate_vec, works_total, citations_total, coauthors, docs_used, selected_texts
 
 
 def write_markdown_report(output_path: Path, ranking: pd.DataFrame, project_doc_count: int) -> None:
@@ -539,7 +739,6 @@ def write_markdown_report(output_path: Path, ranking: pd.DataFrame, project_doc_
         f"- Name: **{best['name']}**",
         f"- Final score: **{best['final_score']:.4f}**",
         f"- ML compatibility score: **{best['ml_score']:.4f}**",
-        f"- Works analyzed online: **{int(best['works_total'])}**",
         "",
         "## Full Ranking",
         "",
@@ -589,22 +788,22 @@ def parse_args() -> argparse.Namespace:
         help="Contact email to include in OpenAlex requests for better rate-limit handling",
     )
     parser.add_argument(
-        "--activity-weight",
-        type=float,
-        default=0.20,
-        help="Weight for global scientific activity score in final ranking",
-    )
-    parser.add_argument(
-        "--pe-overlap-weight",
-        type=float,
-        default=0.03,
-        help="Weight for PE overlap score in final ranking (kept much smaller than activity weight)",
-    )
-    parser.add_argument(
         "--s2-api-key",
         type=str,
         default="",
         help="Semantic Scholar API key (optional). If omitted, environment variable S2_API_KEY is used.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="allenai-specter",
+        help="Scientific embedding model name used by sentence-transformers.",
+    )
+    parser.add_argument(
+        "--embedding-weight",
+        type=float,
+        default=0.60,
+        help="Weight of embedding similarity in hybrid score (0-1).",
     )
     return parser.parse_args()
 
@@ -630,7 +829,7 @@ def main() -> None:
     if not project_text_raw.strip():
         raise ValueError("No usable text found in project documents")
 
-    project_text = project_text_raw
+    project_text = expand_scientific_terms(project_text_raw)
 
     stop_words = language_stopwords(args.language)
     vectorizer = HashingVectorizer(
@@ -645,6 +844,26 @@ def main() -> None:
 
     project_vec = vectorizer.transform([project_text])
     project_vec = normalize(project_vec, norm="l2")
+
+    embedding_weight = min(max(args.embedding_weight, 0.0), 1.0)
+    lexical_weight = 1.0 - embedding_weight
+    embedding_model = load_embedding_model(args.embedding_model)
+    if embedding_model is None:
+        lexical_weight = 1.0
+        embedding_weight = 0.0
+    scorer = SimilarityScorer(
+        vectorizer=vectorizer,
+        project_text=project_text,
+        project_vec=project_vec,
+        embedding_model=embedding_model,
+        lexical_weight=lexical_weight,
+        embedding_weight=embedding_weight,
+    )
+    mode_label = "hybrid" if embedding_model is not None else "lexical-only"
+    print(
+        f"[INFO] Similarity mode: {mode_label} "
+        f"(lexical_weight={lexical_weight:.2f}, embedding_weight={embedding_weight:.2f})"
+    )
 
     inferred_pes, pe_counts = infer_project_pe(project_text_raw)
     if not inferred_pes:
@@ -685,11 +904,7 @@ def main() -> None:
         citations_total = 0
         coauthors: set[str] = set()
         docs_used = 0
-
-        works_openalex = 0
-        works_semanticscholar = 0
-        citations_openalex = 0
-        citations_semanticscholar = 0
+        candidate_selected_texts: list[str] = []
 
         openalex_author_id = ""
         semantic_author_id = ""
@@ -701,10 +916,11 @@ def main() -> None:
                     mailto=args.openalex_mailto,
                 )
                 openalex_author_id = author_id
-                oa_vec, oa_works, oa_citations, oa_coauthors, oa_docs = stream_openalex_works(
+                oa_vec, oa_works, oa_citations, oa_coauthors, oa_docs, oa_selected_texts = stream_openalex_works(
                     author_id=author_id,
                     candidate_name=candidate.name,
                     vectorizer=vectorizer,
+                    scorer=scorer,
                     mailto=args.openalex_mailto,
                     from_year=args.from_year,
                     max_works=effective_max_works,
@@ -715,8 +931,7 @@ def main() -> None:
                 citations_total += oa_citations
                 coauthors.update(oa_coauthors)
                 docs_used += oa_docs
-                works_openalex = oa_works
-                citations_openalex = oa_citations
+                candidate_selected_texts.extend(oa_selected_texts)
             except ValueError:
                 print(
                     f"[WARN] OpenAlex author not found for candidate "
@@ -728,10 +943,11 @@ def main() -> None:
                 s2_author_id, s2_h_index = resolve_semantic_scholar_author_id(candidate, s2_api_key=s2_api_key)
                 if s2_author_id:
                     semantic_author_id = s2_author_id
-                    s2_vec, s2_works, s2_citations, s2_coauthors, s2_docs = stream_semantic_scholar_papers(
+                    s2_vec, s2_works, s2_citations, s2_coauthors, s2_docs, s2_selected_texts = stream_semantic_scholar_papers(
                         author_id=s2_author_id,
                         candidate_name=candidate.name,
                         vectorizer=vectorizer,
+                        scorer=scorer,
                         s2_api_key=s2_api_key,
                         from_year=args.from_year,
                         max_works=effective_max_works,
@@ -742,8 +958,7 @@ def main() -> None:
                     citations_total += s2_citations
                     coauthors.update(s2_coauthors)
                     docs_used += s2_docs
-                    works_semanticscholar = s2_works
-                    citations_semanticscholar = s2_citations
+                    candidate_selected_texts.extend(s2_selected_texts)
                     if resolved_h_index is None and s2_h_index is not None:
                         resolved_h_index = s2_h_index
             except requests.HTTPError as exc:
@@ -761,7 +976,13 @@ def main() -> None:
             continue
 
         aggregate_vec = normalize(aggregate_vec, norm="l2")
-        ml_score = float(cosine_similarity(aggregate_vec, project_vec)[0, 0])
+        lexical_ml_score = float(cosine_similarity(aggregate_vec, project_vec)[0, 0])
+        candidate_profile_text = normalize_text(" ".join(candidate_selected_texts))
+        embedding_ml_score = scorer.embedding_similarity(candidate_profile_text)
+        if embedding_ml_score is None:
+            ml_score = lexical_ml_score
+        else:
+            ml_score = lexical_weight * lexical_ml_score + embedding_weight * embedding_ml_score
 
         profile = MinimalConflictProfile(
             candidate_id=candidate.candidate_id,
@@ -773,8 +994,6 @@ def main() -> None:
         reasons = conflict_reasons(profile, rules)
         is_conflict = len(reasons) > 0
         eligible = (not is_conflict) if args.conflict_mode == "exclude" else True
-
-        activity_score = compute_activity_score(works_total, citations_total, resolved_h_index)
 
         rows.append(
             {
@@ -790,56 +1009,22 @@ def main() -> None:
                 "pe_overlap_count": len(candidate.pe_areas.intersection(project_pes)),
                 "sources_used": ",".join(sources),
                 "ml_score": ml_score,
-                "activity_score_raw": activity_score,
                 "documents_used": docs_used,
-                "works_total": works_total,
-                "citations_total": citations_total,
-                "works_openalex": works_openalex,
-                "works_semanticscholar": works_semanticscholar,
-                "citations_openalex": citations_openalex,
-                "citations_semanticscholar": citations_semanticscholar,
-                "h_index": resolved_h_index,
                 "is_conflict": is_conflict,
                 "eligible": eligible,
                 "conflict_reasons": " | ".join(reasons),
             }
         )
         print(
-            f"[INFO] Candidate done: {candidate.candidate_id} | works_total={works_total}, "
-            f"citations_total={citations_total}, ml_score={ml_score:.4f}, eligible={eligible}"
+            f"[INFO] Candidate done: {candidate.candidate_id} | "
+            f"ml_score={ml_score:.4f}, eligible={eligible}"
         )
 
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         raise ValueError("No candidates processed")
 
-    min_a = float(ranking["activity_score_raw"].min())
-    max_a = float(ranking["activity_score_raw"].max())
-    if max_a > min_a:
-        ranking["activity_score"] = (ranking["activity_score_raw"] - min_a) / (max_a - min_a)
-    else:
-        ranking["activity_score"] = 0.0
-
-    denom = max(1, len(project_pes))
-    ranking["pe_overlap_score"] = ranking["pe_overlap_count"] / denom
-
-    activity_weight = min(max(args.activity_weight, 0.0), 1.0)
-    requested_pe_overlap_weight = min(max(args.pe_overlap_weight, 0.0), 1.0)
-    # Keep PE overlap contribution much smaller than activity contribution.
-    pe_overlap_weight_cap = activity_weight * 0.35
-    pe_overlap_weight = min(requested_pe_overlap_weight, pe_overlap_weight_cap)
-    if pe_overlap_weight < requested_pe_overlap_weight:
-        print(
-            "[INFO] pe-overlap-weight reduced to preserve relative importance: "
-            f"requested={requested_pe_overlap_weight:.4f}, applied={pe_overlap_weight:.4f}, "
-            f"activity_weight={activity_weight:.4f}"
-        )
-    base_ml_weight = max(0.0, 1.0 - activity_weight - pe_overlap_weight)
-    ranking["final_score"] = (
-        base_ml_weight * ranking["ml_score"]
-        + activity_weight * ranking["activity_score"]
-        + pe_overlap_weight * ranking["pe_overlap_score"]
-    )
+    ranking["final_score"] = ranking["ml_score"]
 
     ranking = ranking.sort_values(by=["eligible", "final_score"], ascending=[False, False]).reset_index(drop=True)
     ranking["rank"] = np.arange(1, len(ranking) + 1)
@@ -856,18 +1041,9 @@ def main() -> None:
             "project_pes",
             "candidate_pe_areas",
             "pe_overlap_count",
-            "pe_overlap_score",
             "sources_used",
             "final_score",
             "ml_score",
-            "activity_score",
-            "works_total",
-            "citations_total",
-            "works_openalex",
-            "works_semanticscholar",
-            "citations_openalex",
-            "citations_semanticscholar",
-            "h_index",
             "documents_used",
             "is_conflict",
             "eligible",
@@ -892,7 +1068,6 @@ def main() -> None:
     print(f"Name: {winner['name']}")
     print(f"Final score: {winner['final_score']:.4f}")
     print(f"ML score: {winner['ml_score']:.4f}")
-    print(f"Online works analyzed: {int(winner['works_total'])}")
     print(f"Candidates in conflict: {int(ranking['is_conflict'].sum())}")
     print()
     print(f"Ranking CSV: {csv_path}")
