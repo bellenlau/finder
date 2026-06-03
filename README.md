@@ -1,167 +1,113 @@
-# Ref Finder ML
+# Ref Finder
 
-Strumento per selezionare il referee scientifico ottimale da una lista di candidati, usando compatibilita' scientifica calcolata con machine learning sui testi:
-- articoli scientifici dei candidati
-- documenti interni del progetto
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Shell-Bash](https://img.shields.io/badge/shell-bash-informational)
+![Online Sources](https://img.shields.io/badge/sources-OpenAlex%20%2B%20Semantic%20Scholar-success)
+![Status](https://img.shields.io/badge/status-active-brightgreen)
 
-Il modello usa similarita' semantica ibrida (lessicale + embeddings scientifici) sul corpus documentale.
-Default lingua analisi: inglese (`--language en`).
+## TL;DR
 
-## Policy backup del repo
+Ref Finder ranks scientific reviewer candidates against project documents, then enforces conflict-of-interest rules.
 
-Questo repository contiene solo file backupabili (codice, configurazioni e template).
+- Best for: reviewer recommendation with transparent scoring and COI controls
+- Input: project docs + candidate table
+- Output: ranked CSV/Markdown reports with debug evidence columns
 
-- input reali: non versionati
-- output generati: non versionati
-- template versionato: `data/template.csv`
-
-## Modalita' scalabile senza download pubblicazioni
-
-Se non vuoi scaricare articoli in locale, usa il motore online streaming:
-
-```bash
-python src/online_referee_matcher.py --language en --sources openalex,semanticscholar --conflict-mode exclude --openalex-mailto your-email@example.org
-```
-
-In questo caso la PE viene inferita automaticamente dai documenti progetto (pattern tipo `PE4`, `PE5`, ...).
-Se nel progetto compaiono piu' PE, vengono considerate tutte.
-
-Per usare direttamente la tabella originale `candidates_latest.csv` (separatore `;`, colonne italiane):
-
-```bash
-python src/online_referee_matcher.py --candidates-csv ./data/candidates_latest.csv --language en --sources openalex,semanticscholar --conflict-mode exclude --openalex-mailto your-email@example.org
-```
-
-Caratteristiche:
-- analizza il contenuto scientifico dei candidati via sorgenti multiple (OpenAlex + Semantic Scholar)
-- applica il filtro PE all'inizio della pipeline (prima di qualsiasi chiamata API)
-- analizza solo candidati con almeno una PE in comune col progetto (PE inferite automaticamente dal testo progetto)
-- espande automaticamente i termini scientifici (sinonimi/concetti correlati) per migliorare il matching di sotto-argomenti
-- legge i metadati bibliografici online (titolo + abstract, non full-text PDF) e seleziona i lavori piu' affini all'argomento del progetto
-- supporta embeddings scientifici (`sentence-transformers`, default modello `allenai-specter`) con fallback lessicale
-- non richiede alcun parametro PE da CLI
-- legge in automatico sia schema canonico sia schema `candidates_latest` (`Referee ID`, `Nome`, `Cognome`, `Panel ID1..5`)
-- non salva pubblicazioni su disco
-- mantiene solo output finali di ranking in `output/`
-- applica comunque il filtro conflitti di interesse
-
-Output modalita' online:
-- `output/online_referee_ranking.csv`
-- `output/online_referee_ranking.md`
-
-Note:
-- puoi fornire `openalex_author_id` nel CSV per evitare errori di disambiguazione autore
-- puoi usare `--sources` per selezionare le sorgenti (`openalex`, `semanticscholar`)
-- per Semantic Scholar puoi passare `--s2-api-key` oppure usare la variabile ambiente `S2_API_KEY`
-- il ranking finale online combina `ml_score` (profilo candidato vs progetto) e `focus_score` (media top-k paper piu' affini)
-- puoi regolare il blend con `--focus-weight` (default `0.35`) e `--focus-top-k` (default `8`)
-- formula punteggio finale: `final_score = (1 - focus_weight) * ml_score + focus_weight * focus_score`
-- puoi configurare embeddings con `--embedding-model` (default `allenai-specter`)
-- puoi bilanciare matching lessicale/embedding con `--embedding-weight` (default `0.60`)
-- puoi forzare il device embeddings con `--embedding-device` (`auto|cpu|cuda|mps`)
-- se il caricamento embeddings si blocca, usa `--embedding-device cpu` o disattiva embeddings con `--embedding-weight 0` (in questo caso il modello embeddings non viene caricato)
-- default `--max-works` e' `100` per sorgente/candidato
-- full scan solo esplicito con `--full-scan`
-- puoi regolare dettagli debug con `--debug-top-n` (default `5`)
-- il log runtime riporta quale candidato e' in analisi e lo stato di completamento
-
-Nel CSV online e' presente la colonna `debug_focus_top_works` con i principali lavori che hanno contribuito al `focus_score`.
-Formato: `source|affinity|year|title` separati da ` || `.
-Sono inoltre presenti le colonne `final_score`, `ml_score` e `focus_score` per audit completo del ranking.
-
-## Struttura
-
-- `data/template.csv`: template CSV da usare come base per i dati reali
-- `src/referee_matcher.py`: motore di ranking ML
-- `output/`: ranking generato (locale, non versionato)
-
-## Formato `data/candidates.csv`
-
-Colonne obbligatorie:
-- `candidate_id`
-- `name`
-
-Colonne opzionali:
-- `docs_glob`: pattern glob relativo alla root del progetto (es. `data/candidates/cand_001/**/*`)
-- `notes`: testo libero con parole chiave o info aggiuntive
-- `scholar_query`: stringa query autore per il recupero automatico da rete
-- `openalex_author_id`: ID autore OpenAlex (consigliato per analisi online completa e robusta)
-- `pe_areas`: aree PE del candidato, separate da `;` o `,` (es. `PE4;PE5`)
-- `institution`: ente del candidato (usato dal filtro conflitti)
-- `department`: dipartimento del candidato (usato dal filtro conflitti su `project_departments`)
-
-Note compatibilita' CSV legacy:
-- in `candidates_latest.csv` vengono gestiti anche alias come `Ente dipartimento` / `Department` per popolare automaticamente `department`
-
-Esempio:
-
-```csv
-candidate_id,name,docs_glob,notes,scholar_query
-cand_001,Dr. Alice Rossi,data/candidates/cand_001/**/*,"DFT, materiali","Alice Rossi computational materials"
-```
-
-## Raccolta automatica articoli da rete
-
-Per popolare automaticamente il database pubblicazioni dei candidati puoi usare lo script:
-
-```bash
-python src/fetch_publications.py --max-papers 25 --from-year 2018 --sources openalex,semanticscholar
-```
-
-Modalita' leggera consigliata (pochi download):
-
-```bash
-python src/fetch_publications.py --sources openalex,semanticscholar --max-papers 6 --max-total-papers 80 --from-year 2021 --min-citations 10 --write-mode single-profile
-```
-
-Con `--write-mode single-profile` viene scritto un solo file `_profile_corpus.txt` per candidato (invece di un file per paper).
-
-Cosa fa:
-- interroga OpenAlex e Semantic Scholar (fonti bibliografiche aperte, compatibili con workflow "stile Google Scholar")
-- salva i paper in `data/candidates/<candidate_id>/auto/*.txt`
-- ogni file contiene titolo, autori, venue, DOI, citazioni e abstract
-
-Se hai una API key Semantic Scholar, puoi impostarla per aumentare l'affidabilita' delle richieste:
-
-```bash
-export S2_API_KEY="<tua_api_key>"
-```
-
-Poi esegui il ranking ML:
-
-```bash
-python src/referee_matcher.py
-```
-
-## Filtro conflitti di interesse
-
-Il ranking applica automaticamente un filtro conflitti usando `data/project/conflicts.yaml`.
-
-Regole supportate:
-- `excluded_candidate_ids`: esclusione diretta per ID
-- `excluded_names`: esclusione diretta per nominativo
-- `project_institutions`: conflitto se il candidato risulta dello stesso ente
-- `project_departments`: conflitto se il candidato risulta dello stesso dipartimento del PI/team
-- `project_team`: conflitto se compaiono coautori nel team progetto (da righe `Authors:` nei documenti)
-
-Nota sul match dipartimento:
-- il confronto e' normalizzato (accenti/simboli/spazi)
-- usa overlap token + fuzzy similarity per gestire varianti lessicali (es. IT/EN)
-
-Modalita':
-- `--conflict-mode exclude` (default): candidati in conflitto non eleggibili
-- `--conflict-mode flag`: conflitti solo segnalati, ma candidati ancora selezionabili
-
-## Setup
+## Quickstart (Copy/Paste)
 
 ```bash
 cd ref_finder/finder
-python -m venv .venv
-source ./.venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 src/online_referee_matcher.py \
+  --language en \
+  --sources openalex,semanticscholar \
+  --conflict-mode exclude \
+  --openalex-mailto your-email@example.org
+```
+
+Ref Finder recommends the best scientific reviewer from a candidate list by matching project content against candidate publication profiles, then applying conflict-of-interest (COI) filters.
+
+The project includes two ranking paths:
+- offline: local documents and TF-IDF similarity
+- online streaming: OpenAlex and Semantic Scholar metadata, with optional sentence-transformer embeddings
+
+## Highlights
+
+- scientific relevance ranking from project text and candidate publication signals
+- online streaming mode with no local publication dump required
+- automatic PE code detection from project documents (for example PE4, PE5)
+- hard PE pre-filter before API calls
+- COI filtering for:
+  - explicit candidate/name exclusions
+  - same institution
+  - same department
+  - co-authorship with project team
+- hybrid scoring in online mode:
+  - ml_score (profile-to-project match)
+  - focus_score (top-k most relevant selected works)
+  - final_score blend
+- built-in debug columns to inspect why candidates rank high
+
+## How Ranking Works
+
+### Online mode scoring
+
+For each candidate:
+- collect works from selected sources
+- rank works by project affinity
+- keep selected works and compute:
+  - ml_score
+  - focus_score
+- combine scores:
+
+final_score = (1 - focus_weight) * ml_score + focus_weight * focus_score
+
+### Embeddings behavior
+
+Embeddings are integrated in online mode only when all these are true:
+- sentence-transformers is installed
+- embedding_weight > 0
+- the model loads successfully
+
+At startup, check logs:
+- Similarity mode: hybrid -> embeddings active
+- Similarity mode: lexical-only -> embeddings not contributing
+
+To explicitly disable embeddings:
+- set --embedding-weight 0
+
+To force CPU execution for embeddings:
+- set --embedding-device cpu
+
+## Repository Layout
+
+- src/referee_matcher.py: offline ranking engine
+- src/online_referee_matcher.py: online streaming ranking engine
+- src/fetch_publications.py: optional local publication fetcher
+- src/candidates_loader.py: canonical + legacy candidates CSV normalization
+- data/project/: project documents and conflicts file
+- data/template.csv: candidate table template
+- output/: generated rankings
+
+## Requirements
+
+- Python 3.10+
+- bash shell
+- internet access for online mode
+
+## Installation
+
+```bash
+cd ref_finder/finder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-In alternativa, inizializzazione automatica per nuovo utilizzo:
+Optional one-shot initializer:
 
 ```bash
 cd ref_finder/finder
@@ -169,54 +115,175 @@ chmod +x ./scripts/init-local.sh
 ./scripts/init-local.sh
 ```
 
-Opzioni utili script Bash:
-- `--skip-install`: prepara solo struttura file/cartelle senza installare dipendenze
-- `--recreate-venv`: ricrea la virtualenv da zero
-
-## Esecuzione
+Useful init flags:
 
 ```bash
-python src/referee_matcher.py
+./scripts/init-local.sh --help
+./scripts/init-local.sh --recreate-venv
+./scripts/init-local.sh --skip-install
 ```
 
-Output generati:
-- `output/referee_ranking.csv`
-- `output/referee_ranking.md`
-
-## Parametri utili
+## Quick Start (Online Streaming)
 
 ```bash
-python src/referee_matcher.py \
+cd ref_finder/finder
+source .venv/bin/activate
+python3 src/online_referee_matcher.py \
+  --language en \
+  --sources openalex,semanticscholar \
+  --conflict-mode exclude \
+  --openalex-mailto your-email@example.org
+```
+
+Run with legacy candidates file:
+
+```bash
+python3 src/online_referee_matcher.py \
+  --candidates-csv ./data/candidates_latest.csv \
+  --language en \
+  --sources openalex,semanticscholar \
+  --conflict-mode exclude \
+  --openalex-mailto your-email@example.org
+```
+
+## Input Data
+
+### Project documents
+
+Place project files under data/project/ using supported extensions:
+- .txt
+- .md
+- .pdf
+- .docx
+
+Include PE codes in project text if you want automatic PE filtering.
+
+### Candidates table
+
+Use data/candidates.csv (or a legacy-compatible file).
+
+Required columns:
+- candidate_id
+- name
+
+Optional columns:
+- docs_glob
+- notes
+- scholar_query
+- openalex_author_id
+- pe_areas
+- institution
+- department
+
+Legacy aliases are supported for department, including Ente dipartimento and Department.
+
+## Conflict Rules
+
+Configure COI in data/project/conflicts.yaml.
+
+Create a starter file from bash:
+
+```bash
+cat > data/project/conflicts.yaml <<'YAML'
+excluded_candidate_ids: []
+excluded_names: []
+project_institutions: []
+project_departments: []
+project_team: []
+YAML
+```
+
+Department COI matching is normalized and fuzzy-aware (accents/symbols/token overlap + similarity).
+
+## Output Files
+
+Online mode writes:
+- output/online_referee_ranking.csv
+- output/online_referee_ranking.md
+
+Offline mode writes:
+- output/referee_ranking.csv
+- output/referee_ranking.md
+
+Important online output columns:
+- final_score
+- ml_score
+- focus_score
+- debug_focus_top_works
+- is_conflict
+- eligible
+- conflict_reasons
+
+debug_focus_top_works format:
+- source|affinity|year|title entries joined by ||
+
+## Key CLI Options (Online)
+
+- --sources openalex,semanticscholar
+- --openalex-mailto <email>
+- --s2-api-key <key> (or use S2_API_KEY)
+- --embedding-model allenai-specter
+- --embedding-weight 0.60
+- --embedding-device auto|cpu|cuda|mps
+- --focus-weight 0.35
+- --focus-top-k 8
+- --max-works 100
+- --full-scan
+- --debug-top-n 5
+- --conflict-mode exclude|flag
+
+## Offline Workflow (Optional)
+
+Fetch local candidate corpora:
+
+```bash
+python3 src/fetch_publications.py \
+  --sources openalex,semanticscholar \
+  --max-papers 25 \
+  --from-year 2018
+```
+
+Run offline ranking:
+
+```bash
+python3 src/referee_matcher.py \
   --base-dir . \
   --project-dir ./data/project \
   --candidates-csv ./data/candidates.csv \
   --output-dir ./output \
-  --top-terms 12 \
   --language en \
   --conflicts-file ./data/project/conflicts.yaml \
   --conflict-mode exclude
 ```
 
-## Come personalizzarlo sul tuo caso reale
+## Debugging Hangs and Slow Runs
 
-1. Sostituisci i file in `data/project/` con i tuoi documenti reali.
-2. Inserisci i candidati reali in `data/candidates.csv`.
-3. Crea una cartella per ogni candidato in `data/candidates/<candidate_id>/` e carica gli articoli/documenti.
-4. Esegui lo script e usa il primo in classifica come referee consigliato.
+Disable embeddings entirely:
 
-Workflow consigliato completo:
+```bash
+python3 src/online_referee_matcher.py --embedding-weight 0
+```
 
-1. Aggiorna `data/candidates.csv` con candidati e `scholar_query`.
-2. Esegui `python src/fetch_publications.py --sources openalex,semanticscholar` per creare il database articoli da rete.
-3. Aggiungi eventuali documenti interni in `data/candidates/<candidate_id>/`.
-4. Definisci il file `data/project/conflicts.yaml` con le tue regole COI.
-5. Esegui `python src/referee_matcher.py` per ottenere il referee ottimale.
+Force embeddings on CPU:
 
-## Limiti del modello attuale
+```bash
+python3 src/online_referee_matcher.py --embedding-device cpu
+```
 
-- Il ranking resta principalmente testuale-semantico; il filtro conflitti e' rule-based.
-- Non usa supervisione con etichette storiche (e' un modello unsupervised).
-- Se vuoi, nel passo successivo possiamo aggiungere:
-  - embeddings transformer (es. SciBERT/SentenceTransformers)
-  - rilevazione conflitti temporale piu' rigorosa (es. co-autori negli ultimi N anni via metadati strutturati)
-  - calibrazione pesi per documenti interni vs pubblicazioni
+Run in background and stream logs:
+
+```bash
+nohup python3 src/online_referee_matcher.py --embedding-device cpu > run.log 2>&1 &
+tail -f run.log
+```
+
+## Current Limits
+
+- ranking is primarily text/semantic matching plus rule-based COI filtering
+- online mode uses title + abstract metadata, not full-text PDFs
+- result quality depends on OpenAlex and Semantic Scholar metadata coverage
+- method is unsupervised (no historical assignment labels used)
+
+## License
+
+See repository license files for terms and notices.
