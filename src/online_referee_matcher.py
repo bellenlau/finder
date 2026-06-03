@@ -155,7 +155,7 @@ def expand_scientific_terms(text: str) -> str:
     return normalize_text(f"{base} {' '.join(additions)}")
 
 
-def load_embedding_model(model_name: str) -> Any | None:
+def load_embedding_model(model_name: str, device: str = "auto") -> Any | None:
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -166,8 +166,14 @@ def load_embedding_model(model_name: str) -> Any | None:
         return None
 
     try:
-        print(f"[INFO] Loading scientific embedding model: {model_name}")
-        return SentenceTransformer(model_name)
+        target_device = None if device == "auto" else device
+        print(
+            f"[INFO] Loading scientific embedding model: {model_name} "
+            f"(device={device})"
+        )
+        if target_device is None:
+            return SentenceTransformer(model_name)
+        return SentenceTransformer(model_name, device=target_device)
     except Exception as exc:
         print(
             "[WARN] Unable to load embedding model; using lexical similarity only. "
@@ -500,7 +506,7 @@ def stream_openalex_works(
     from_year: int | None,
     max_works: int | None,
     sleep_seconds: float,
-) -> tuple[csr_matrix, int, int, set[str], int, list[str]]:
+) -> tuple[csr_matrix, int, int, set[str], int, list[str], list[float], list[str]]:
     cursor = "*"
     per_page = 200
 
@@ -576,6 +582,8 @@ def stream_openalex_works(
     coauthors: set[str] = set()
     docs_used = 0
     selected_texts: list[str] = []
+    selected_affinities: list[float] = []
+    selected_debug_rows: list[str] = []
 
     for rank, (score, item) in enumerate(selected, start=1):
         year = item.get("year")
@@ -592,6 +600,10 @@ def stream_openalex_works(
             aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
             docs_used += 1
             selected_texts.append(text)
+            selected_affinities.append(float(score))
+            selected_debug_rows.append(
+                f"openalex|{float(score):.4f}|{year_for_log}|{short_log_text(str(item.get('title', '')), max_len=90)}"
+            )
 
         works_total += 1
         citations_total += int(item.get("citations", 0) or 0)
@@ -604,7 +616,16 @@ def stream_openalex_works(
         f"[INFO] OpenAlex scanned {scanned_count} works for {candidate_name}, "
         f"selected {works_total} by title affinity"
     )
-    return aggregate_vec, works_total, citations_total, coauthors, docs_used, selected_texts
+    return (
+        aggregate_vec,
+        works_total,
+        citations_total,
+        coauthors,
+        docs_used,
+        selected_texts,
+        selected_affinities,
+        selected_debug_rows,
+    )
 
 
 def stream_semantic_scholar_papers(
@@ -616,7 +637,7 @@ def stream_semantic_scholar_papers(
     from_year: int | None,
     max_works: int | None,
     sleep_seconds: float,
-) -> tuple[csr_matrix, int, int, set[str], int, list[str]]:
+) -> tuple[csr_matrix, int, int, set[str], int, list[str], list[float], list[str]]:
     limit = 100
     offset = 0
 
@@ -691,6 +712,8 @@ def stream_semantic_scholar_papers(
     coauthors: set[str] = set()
     docs_used = 0
     selected_texts: list[str] = []
+    selected_affinities: list[float] = []
+    selected_debug_rows: list[str] = []
 
     for rank, (score, item) in enumerate(selected, start=1):
         year = item.get("year")
@@ -707,6 +730,10 @@ def stream_semantic_scholar_papers(
             aggregate_vec = vec if aggregate_vec is None else (aggregate_vec + vec)
             docs_used += 1
             selected_texts.append(text)
+            selected_affinities.append(float(score))
+            selected_debug_rows.append(
+                f"semanticscholar|{float(score):.4f}|{year_for_log}|{short_log_text(str(item.get('title', '')), max_len=90)}"
+            )
 
         works_total += 1
         citations_total += int(item.get("citations", 0) or 0)
@@ -719,7 +746,49 @@ def stream_semantic_scholar_papers(
         f"[INFO] Semantic Scholar scanned {scanned_count} works for {candidate_name}, "
         f"selected {works_total} by title affinity"
     )
-    return aggregate_vec, works_total, citations_total, coauthors, docs_used, selected_texts
+    return (
+        aggregate_vec,
+        works_total,
+        citations_total,
+        coauthors,
+        docs_used,
+        selected_texts,
+        selected_affinities,
+        selected_debug_rows,
+    )
+
+
+def compute_focus_score(affinities: list[float], top_k: int) -> float:
+    if not affinities:
+        return 0.0
+    k = max(1, min(len(affinities), top_k))
+    ordered = sorted(float(v) for v in affinities if isinstance(v, (int, float)))
+    if not ordered:
+        return 0.0
+    return float(np.mean(ordered[-k:]))
+
+
+def top_debug_entries(debug_rows: list[str], top_n: int) -> str:
+    if not debug_rows:
+        return ""
+
+    parsed: list[tuple[float, str]] = []
+    for row in debug_rows:
+        parts = row.split("|", 3)
+        if len(parts) != 4:
+            continue
+        try:
+            score = float(parts[1])
+        except ValueError:
+            continue
+        parsed.append((score, row))
+
+    if not parsed:
+        return ""
+
+    parsed.sort(key=lambda item: item[0], reverse=True)
+    n = max(1, min(top_n, len(parsed)))
+    return " || ".join(row for _, row in parsed[:n])
 
 
 def write_markdown_report(output_path: Path, ranking: pd.DataFrame, project_doc_count: int) -> None:
@@ -805,6 +874,31 @@ def parse_args() -> argparse.Namespace:
         default=0.60,
         help="Weight of embedding similarity in hybrid score (0-1).",
     )
+    parser.add_argument(
+        "--embedding-device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device for sentence-transformers model loading.",
+    )
+    parser.add_argument(
+        "--focus-weight",
+        type=float,
+        default=0.35,
+        help="Weight of top-paper affinity focus score in final score (0-1).",
+    )
+    parser.add_argument(
+        "--focus-top-k",
+        type=int,
+        default=8,
+        help="How many best-affinity selected papers are averaged for focus score.",
+    )
+    parser.add_argument(
+        "--debug-top-n",
+        type=int,
+        default=5,
+        help="How many top contributing papers to store in debug columns.",
+    )
     return parser.parse_args()
 
 
@@ -847,7 +941,15 @@ def main() -> None:
 
     embedding_weight = min(max(args.embedding_weight, 0.0), 1.0)
     lexical_weight = 1.0 - embedding_weight
-    embedding_model = load_embedding_model(args.embedding_model)
+    embedding_model = None
+    if embedding_weight > 0:
+        embedding_model = load_embedding_model(
+            args.embedding_model,
+            device=args.embedding_device,
+        )
+    else:
+        print("[INFO] Embeddings disabled (embedding_weight=0.0): lexical-only mode.")
+
     if embedding_model is None:
         lexical_weight = 1.0
         embedding_weight = 0.0
@@ -891,6 +993,15 @@ def main() -> None:
     rules = load_conflict_rules(conflicts_file)
 
     rows: list[dict[str, Any]] = []
+    focus_weight = min(max(args.focus_weight, 0.0), 1.0)
+    profile_weight = 1.0 - focus_weight
+    focus_top_k = max(1, int(args.focus_top_k))
+    debug_top_n = max(1, int(args.debug_top_n))
+    print(
+        f"[INFO] Final score weights: profile_ml={profile_weight:.2f}, "
+        f"focus_topk={focus_weight:.2f} (top_k={focus_top_k})"
+    )
+
     for idx, candidate in enumerate(candidates, start=1):
         print(
             f"[INFO] Analyzing candidate {idx}/{len(candidates)}: "
@@ -905,6 +1016,8 @@ def main() -> None:
         coauthors: set[str] = set()
         docs_used = 0
         candidate_selected_texts: list[str] = []
+        candidate_selected_affinities: list[float] = []
+        candidate_debug_rows: list[str] = []
 
         openalex_author_id = ""
         semantic_author_id = ""
@@ -916,7 +1029,16 @@ def main() -> None:
                     mailto=args.openalex_mailto,
                 )
                 openalex_author_id = author_id
-                oa_vec, oa_works, oa_citations, oa_coauthors, oa_docs, oa_selected_texts = stream_openalex_works(
+                (
+                    oa_vec,
+                    oa_works,
+                    oa_citations,
+                    oa_coauthors,
+                    oa_docs,
+                    oa_selected_texts,
+                    oa_selected_affinities,
+                    oa_selected_debug_rows,
+                ) = stream_openalex_works(
                     author_id=author_id,
                     candidate_name=candidate.name,
                     vectorizer=vectorizer,
@@ -932,6 +1054,8 @@ def main() -> None:
                 coauthors.update(oa_coauthors)
                 docs_used += oa_docs
                 candidate_selected_texts.extend(oa_selected_texts)
+                candidate_selected_affinities.extend(oa_selected_affinities)
+                candidate_debug_rows.extend(oa_selected_debug_rows)
             except ValueError:
                 print(
                     f"[WARN] OpenAlex author not found for candidate "
@@ -943,7 +1067,16 @@ def main() -> None:
                 s2_author_id, s2_h_index = resolve_semantic_scholar_author_id(candidate, s2_api_key=s2_api_key)
                 if s2_author_id:
                     semantic_author_id = s2_author_id
-                    s2_vec, s2_works, s2_citations, s2_coauthors, s2_docs, s2_selected_texts = stream_semantic_scholar_papers(
+                    (
+                        s2_vec,
+                        s2_works,
+                        s2_citations,
+                        s2_coauthors,
+                        s2_docs,
+                        s2_selected_texts,
+                        s2_selected_affinities,
+                        s2_selected_debug_rows,
+                    ) = stream_semantic_scholar_papers(
                         author_id=s2_author_id,
                         candidate_name=candidate.name,
                         vectorizer=vectorizer,
@@ -959,6 +1092,8 @@ def main() -> None:
                     coauthors.update(s2_coauthors)
                     docs_used += s2_docs
                     candidate_selected_texts.extend(s2_selected_texts)
+                    candidate_selected_affinities.extend(s2_selected_affinities)
+                    candidate_debug_rows.extend(s2_selected_debug_rows)
                     if resolved_h_index is None and s2_h_index is not None:
                         resolved_h_index = s2_h_index
             except requests.HTTPError as exc:
@@ -984,6 +1119,10 @@ def main() -> None:
         else:
             ml_score = lexical_weight * lexical_ml_score + embedding_weight * embedding_ml_score
 
+        focus_score = compute_focus_score(candidate_selected_affinities, top_k=focus_top_k)
+        final_score = profile_weight * ml_score + focus_weight * focus_score
+        debug_focus_top = top_debug_entries(candidate_debug_rows, top_n=debug_top_n)
+
         profile = MinimalConflictProfile(
             candidate_id=candidate.candidate_id,
             name=candidate.name,
@@ -1008,7 +1147,10 @@ def main() -> None:
                 "candidate_pe_areas": ";".join(sorted(candidate.pe_areas)),
                 "pe_overlap_count": len(candidate.pe_areas.intersection(project_pes)),
                 "sources_used": ",".join(sources),
+                "focus_score": focus_score,
                 "ml_score": ml_score,
+                "final_score": final_score,
+                "debug_focus_top_works": debug_focus_top,
                 "documents_used": docs_used,
                 "is_conflict": is_conflict,
                 "eligible": eligible,
@@ -1017,14 +1159,13 @@ def main() -> None:
         )
         print(
             f"[INFO] Candidate done: {candidate.candidate_id} | "
-            f"ml_score={ml_score:.4f}, eligible={eligible}"
+            f"ml_score={ml_score:.4f}, focus_score={focus_score:.4f}, "
+            f"final_score={final_score:.4f}, eligible={eligible}"
         )
 
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         raise ValueError("No candidates processed")
-
-    ranking["final_score"] = ranking["ml_score"]
 
     ranking = ranking.sort_values(by=["eligible", "final_score"], ascending=[False, False]).reset_index(drop=True)
     ranking["rank"] = np.arange(1, len(ranking) + 1)
@@ -1044,6 +1185,8 @@ def main() -> None:
             "sources_used",
             "final_score",
             "ml_score",
+            "focus_score",
+            "debug_focus_top_works",
             "documents_used",
             "is_conflict",
             "eligible",

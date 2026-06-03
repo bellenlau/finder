@@ -37,7 +37,7 @@ Caratteristiche:
 - applica il filtro PE all'inizio della pipeline (prima di qualsiasi chiamata API)
 - analizza solo candidati con almeno una PE in comune col progetto (PE inferite automaticamente dal testo progetto)
 - espande automaticamente i termini scientifici (sinonimi/concetti correlati) per migliorare il matching di sotto-argomenti
-- legge tutti i titoli disponibili e seleziona i lavori piu' affini all'argomento del progetto
+- legge i metadati bibliografici online (titolo + abstract, non full-text PDF) e seleziona i lavori piu' affini all'argomento del progetto
 - supporta embeddings scientifici (`sentence-transformers`, default modello `allenai-specter`) con fallback lessicale
 - non richiede alcun parametro PE da CLI
 - legge in automatico sia schema canonico sia schema `candidates_latest` (`Referee ID`, `Nome`, `Cognome`, `Panel ID1..5`)
@@ -53,12 +53,21 @@ Note:
 - puoi fornire `openalex_author_id` nel CSV per evitare errori di disambiguazione autore
 - puoi usare `--sources` per selezionare le sorgenti (`openalex`, `semanticscholar`)
 - per Semantic Scholar puoi passare `--s2-api-key` oppure usare la variabile ambiente `S2_API_KEY`
-- il ranking finale e' guidato solo dal punteggio di affinita' scientifica (`ml_score`)
+- il ranking finale online combina `ml_score` (profilo candidato vs progetto) e `focus_score` (media top-k paper piu' affini)
+- puoi regolare il blend con `--focus-weight` (default `0.35`) e `--focus-top-k` (default `8`)
+- formula punteggio finale: `final_score = (1 - focus_weight) * ml_score + focus_weight * focus_score`
 - puoi configurare embeddings con `--embedding-model` (default `allenai-specter`)
 - puoi bilanciare matching lessicale/embedding con `--embedding-weight` (default `0.60`)
+- puoi forzare il device embeddings con `--embedding-device` (`auto|cpu|cuda|mps`)
+- se il caricamento embeddings si blocca, usa `--embedding-device cpu` o disattiva embeddings con `--embedding-weight 0` (in questo caso il modello embeddings non viene caricato)
 - default `--max-works` e' `100` per sorgente/candidato
 - full scan solo esplicito con `--full-scan`
+- puoi regolare dettagli debug con `--debug-top-n` (default `5`)
 - il log runtime riporta quale candidato e' in analisi e lo stato di completamento
+
+Nel CSV online e' presente la colonna `debug_focus_top_works` con i principali lavori che hanno contribuito al `focus_score`.
+Formato: `source|affinity|year|title` separati da ` || `.
+Sono inoltre presenti le colonne `final_score`, `ml_score` e `focus_score` per audit completo del ranking.
 
 ## Struttura
 
@@ -79,6 +88,10 @@ Colonne opzionali:
 - `openalex_author_id`: ID autore OpenAlex (consigliato per analisi online completa e robusta)
 - `pe_areas`: aree PE del candidato, separate da `;` o `,` (es. `PE4;PE5`)
 - `institution`: ente del candidato (usato dal filtro conflitti)
+- `department`: dipartimento del candidato (usato dal filtro conflitti su `project_departments`)
+
+Note compatibilita' CSV legacy:
+- in `candidates_latest.csv` vengono gestiti anche alias come `Ente dipartimento` / `Department` per popolare automaticamente `department`
 
 Esempio:
 
