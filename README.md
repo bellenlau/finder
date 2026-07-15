@@ -221,6 +221,11 @@ debug_focus_top_works format:
 
 - --sources openalex,semanticscholar
 - --openalex-mailto <email>
+- --openalex-max-retries 10
+- --openalex-backoff-seconds 3.0
+- --openalex-min-interval-seconds 1.2
+- --openalex-jitter-seconds 0.3
+- --openalex-max-wait-seconds 90
 - --s2-api-key <key> (or use S2_API_KEY)
 - --embedding-model allenai-specter
 - --embedding-weight 0.60
@@ -230,7 +235,57 @@ debug_focus_top_works format:
 - --max-works 100
 - --full-scan
 - --debug-top-n 5
+- --resume
+- --checkpoint-file online_referee_checkpoint.json
 - --conflict-mode exclude|flag
+
+## Checkpoint And Restart (Online)
+
+The online matcher now supports checkpointing to safely restart long runs.
+
+- default checkpoint path: output/online_referee_checkpoint.json
+- checkpoint is always written inside output/
+- checkpoint is saved after each processed candidate
+- both processed and skipped candidates are tracked
+
+First run:
+
+```bash
+python3 src/online_referee_matcher.py \
+  --language en \
+  --sources openalex,semanticscholar \
+  --conflict-mode exclude \
+  --openalex-mailto your-email@example.org
+```
+
+Restart from checkpoint:
+
+```bash
+python3 src/online_referee_matcher.py \
+  --language en \
+  --sources openalex,semanticscholar \
+  --conflict-mode exclude \
+  --openalex-mailto your-email@example.org \
+  --resume
+```
+
+Use a custom checkpoint file:
+
+```bash
+python3 src/online_referee_matcher.py \
+  --resume \
+  --checkpoint-file my_run_checkpoint.json
+```
+
+Note:
+- resume validates run configuration against the saved checkpoint
+- if configuration differs, the script stops with a signature mismatch error
+- checkpoints from older script versions are accepted when core run settings match
+
+OpenAlex rate-limit note:
+- set `--openalex-mailto` to reduce 429 risk
+- matcher now applies polite throttling + jitter by default for OpenAlex
+- very large `Retry-After` values are capped by `--openalex-max-wait-seconds`
 
 ## Offline Workflow (Optional)
 

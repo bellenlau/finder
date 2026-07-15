@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -33,6 +35,11 @@ SEMANTIC_SCHOLAR_AUTHOR_PAPERS_URL_TMPL = "https://api.semanticscholar.org/graph
 RETRYABLE_STATUS_CODES = {429, 439, 500, 502, 503, 504}
 DEFAULT_MAX_RETRIES = 6
 DEFAULT_BACKOFF_SECONDS = 2.0
+OPENALEX_DEFAULT_MAX_RETRIES = 10
+OPENALEX_DEFAULT_BACKOFF_SECONDS = 3.0
+OPENALEX_DEFAULT_MIN_INTERVAL_SECONDS = 1.2
+OPENALEX_DEFAULT_JITTER_SECONDS = 0.3
+OPENALEX_DEFAULT_MAX_WAIT_SECONDS = 90.0
 
 SCIENTIFIC_TERM_EXPANSIONS: list[tuple[str, str]] = [
     (r"\bdft\b", "density functional theory first principles electronic structure"),
@@ -347,10 +354,25 @@ def request_with_retries(
     source_name: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+    min_interval_seconds: float = 0.0,
+    jitter_seconds: float = 0.0,
+    max_wait_seconds: float | None = None,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
+    last_request_start = 0.0
+
+    def wait_before_request() -> None:
+        nonlocal last_request_start
+        now = time.monotonic()
+        delay = max(0.0, min_interval_seconds - (now - last_request_start))
+        jitter = random.uniform(0.0, max(0.0, jitter_seconds)) if jitter_seconds > 0 else 0.0
+        total_wait = delay + jitter
+        if total_wait > 0:
+            time.sleep(total_wait)
+        last_request_start = time.monotonic()
 
     for attempt in range(max_retries + 1):
+        wait_before_request()
         response = requests.get(url, params=params, headers=headers or {}, timeout=timeout)
 
         if response.status_code not in RETRYABLE_STATUS_CODES:
@@ -359,6 +381,12 @@ def request_with_retries(
 
         retry_after = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
         wait_seconds = retry_after if retry_after > 0 else backoff_seconds * (2**attempt)
+        if max_wait_seconds is not None and wait_seconds > max_wait_seconds:
+            print(
+                f"[WARN] {source_name} requested wait {wait_seconds:.1f}s; "
+                f"capped to {max_wait_seconds:.1f}s"
+            )
+            wait_seconds = max_wait_seconds
         last_error = requests.HTTPError(
             (
                 f"{source_name} transient error ({response.status_code}), "
@@ -376,16 +404,34 @@ def request_with_retries(
     raise RuntimeError(f"{source_name} request failed unexpectedly")
 
 
-def request_json(url: str, params: dict[str, Any], mailto: str, timeout: int = 45) -> dict[str, Any]:
+def request_json(
+    url: str,
+    params: dict[str, Any],
+    mailto: str,
+    timeout: int = 45,
+    max_retries: int = OPENALEX_DEFAULT_MAX_RETRIES,
+    backoff_seconds: float = OPENALEX_DEFAULT_BACKOFF_SECONDS,
+    min_interval_seconds: float = OPENALEX_DEFAULT_MIN_INTERVAL_SECONDS,
+    jitter_seconds: float = OPENALEX_DEFAULT_JITTER_SECONDS,
+    max_wait_seconds: float = OPENALEX_DEFAULT_MAX_WAIT_SECONDS,
+) -> dict[str, Any]:
     request_params = dict(params)
     if mailto.strip():
         request_params["mailto"] = mailto.strip()
+    headers = {
+        "User-Agent": "ref_finder/online_referee_matcher (mailto for contact)",
+    }
     return request_with_retries(
         url=url,
         params=request_params,
-        headers=None,
+        headers=headers,
         timeout=timeout,
         source_name="OpenAlex",
+        max_retries=max_retries,
+        backoff_seconds=backoff_seconds,
+        min_interval_seconds=min_interval_seconds,
+        jitter_seconds=jitter_seconds,
+        max_wait_seconds=max_wait_seconds,
     )
 
 
@@ -407,7 +453,15 @@ def request_semantic_scholar_json(
     )
 
 
-def resolve_openalex_author_id(candidate: OnlineCandidate, mailto: str) -> tuple[str, str, int | None]:
+def resolve_openalex_author_id(
+    candidate: OnlineCandidate,
+    mailto: str,
+    openalex_max_retries: int,
+    openalex_backoff_seconds: float,
+    openalex_min_interval_seconds: float,
+    openalex_jitter_seconds: float,
+    openalex_max_wait_seconds: float,
+) -> tuple[str, str, int | None]:
     if candidate.openalex_author_id:
         return candidate.openalex_author_id, candidate.institution, None
 
@@ -416,7 +470,16 @@ def resolve_openalex_author_id(candidate: OnlineCandidate, mailto: str) -> tuple
         "per-page": 15,
         "sort": "works_count:desc",
     }
-    payload = request_json(OPENALEX_AUTHORS_URL, params=params, mailto=mailto)
+    payload = request_json(
+        OPENALEX_AUTHORS_URL,
+        params=params,
+        mailto=mailto,
+        max_retries=openalex_max_retries,
+        backoff_seconds=openalex_backoff_seconds,
+        min_interval_seconds=openalex_min_interval_seconds,
+        jitter_seconds=openalex_jitter_seconds,
+        max_wait_seconds=openalex_max_wait_seconds,
+    )
     results = payload.get("results", [])
     if not results:
         raise ValueError(f"No OpenAlex author found for candidate {candidate.name}")
@@ -506,9 +569,14 @@ def stream_openalex_works(
     from_year: int | None,
     max_works: int | None,
     sleep_seconds: float,
+    openalex_max_retries: int,
+    openalex_backoff_seconds: float,
+    openalex_min_interval_seconds: float,
+    openalex_jitter_seconds: float,
+    openalex_max_wait_seconds: float,
 ) -> tuple[csr_matrix, int, int, set[str], int, list[str], list[float], list[str]]:
     cursor = "*"
-    per_page = 200
+    per_page = 100
 
     scanned_count = 0
     available_works: list[dict[str, Any]] = []
@@ -522,7 +590,16 @@ def stream_openalex_works(
         if from_year is not None:
             params["filter"] = f"author.id:{author_id},from_publication_date:{from_year}-01-01"
 
-        payload = request_json(OPENALEX_WORKS_URL, params=params, mailto=mailto)
+        payload = request_json(
+            OPENALEX_WORKS_URL,
+            params=params,
+            mailto=mailto,
+            max_retries=openalex_max_retries,
+            backoff_seconds=openalex_backoff_seconds,
+            min_interval_seconds=openalex_min_interval_seconds,
+            jitter_seconds=openalex_jitter_seconds,
+            max_wait_seconds=openalex_max_wait_seconds,
+        )
         results = payload.get("results", [])
         if not results:
             break
@@ -791,6 +868,124 @@ def top_debug_entries(debug_rows: list[str], top_n: int) -> str:
     return " || ".join(row for _, row in parsed[:n])
 
 
+def _checkpoint_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def load_checkpoint(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Invalid checkpoint file: {path} ({exc})") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid checkpoint format (root is not an object): {path}")
+    if int(data.get("version", 0)) != 1:
+        raise ValueError(f"Unsupported checkpoint version in {path}")
+    if "rows" not in data or not isinstance(data.get("rows"), list):
+        raise ValueError(f"Invalid checkpoint: missing 'rows' list in {path}")
+    if "processed_candidate_ids" not in data or not isinstance(data.get("processed_candidate_ids"), list):
+        raise ValueError(f"Invalid checkpoint: missing 'processed_candidate_ids' list in {path}")
+    if "skipped_candidate_ids" not in data or not isinstance(data.get("skipped_candidate_ids"), list):
+        raise ValueError(f"Invalid checkpoint: missing 'skipped_candidate_ids' list in {path}")
+
+    return data
+
+
+def build_run_signature(
+    *,
+    project_dir: Path,
+    candidates_csv: Path,
+    conflicts_file: Path,
+    sources: list[str],
+    args: argparse.Namespace,
+    inferred_pes: list[str],
+) -> dict[str, Any]:
+    return {
+        "project_dir": str(project_dir),
+        "candidates_csv": str(candidates_csv),
+        "conflicts_file": str(conflicts_file),
+        "sources": sorted(sources),
+        "language": args.language,
+        "from_year": args.from_year,
+        "full_scan": bool(args.full_scan),
+        "max_works": None if args.full_scan else int(max(1, int(args.max_works))),
+        "conflict_mode": args.conflict_mode,
+        "focus_weight": float(args.focus_weight),
+        "focus_top_k": int(args.focus_top_k),
+        "debug_top_n": int(args.debug_top_n),
+        "embedding_model": args.embedding_model,
+        "embedding_weight": float(args.embedding_weight),
+        "embedding_device": args.embedding_device,
+        "openalex_max_retries": int(args.openalex_max_retries),
+        "openalex_backoff_seconds": float(args.openalex_backoff_seconds),
+        "openalex_min_interval_seconds": float(args.openalex_min_interval_seconds),
+        "openalex_jitter_seconds": float(args.openalex_jitter_seconds),
+        "openalex_max_wait_seconds": float(args.openalex_max_wait_seconds),
+        "project_pes": list(inferred_pes),
+    }
+
+
+def signature_compatibility_issues(saved: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    required_keys = [
+        "project_dir",
+        "candidates_csv",
+        "conflicts_file",
+        "sources",
+        "language",
+        "from_year",
+        "full_scan",
+        "max_works",
+        "conflict_mode",
+        "focus_weight",
+        "focus_top_k",
+        "debug_top_n",
+        "embedding_model",
+        "embedding_weight",
+        "embedding_device",
+        "project_pes",
+    ]
+
+    issues: list[str] = []
+    for key in required_keys:
+        if key not in saved:
+            issues.append(f"missing key in checkpoint: {key}")
+            continue
+        if saved.get(key) != current.get(key):
+            issues.append(f"{key}: checkpoint={saved.get(key)!r} current={current.get(key)!r}")
+
+    return issues
+
+
+def init_checkpoint_state(run_signature: dict[str, Any]) -> dict[str, Any]:
+    now = _checkpoint_now()
+    return {
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "completed": False,
+        "run_signature": run_signature,
+        "processed_candidate_ids": [],
+        "skipped_candidate_ids": [],
+        "rows": [],
+    }
+
+
+def save_checkpoint(path: Path, state: dict[str, Any]) -> None:
+    state["updated_at"] = _checkpoint_now()
+    atomic_write_json(path, state)
+
+
 def write_markdown_report(output_path: Path, ranking: pd.DataFrame, project_doc_count: int) -> None:
     eligible = ranking[ranking["eligible"] == True]
     if eligible.empty:
@@ -857,6 +1052,36 @@ def parse_args() -> argparse.Namespace:
         help="Contact email to include in OpenAlex requests for better rate-limit handling",
     )
     parser.add_argument(
+        "--openalex-max-retries",
+        type=int,
+        default=OPENALEX_DEFAULT_MAX_RETRIES,
+        help="Maximum OpenAlex retries on transient HTTP errors (default: 10).",
+    )
+    parser.add_argument(
+        "--openalex-backoff-seconds",
+        type=float,
+        default=OPENALEX_DEFAULT_BACKOFF_SECONDS,
+        help="Base backoff seconds for OpenAlex retries (default: 3.0).",
+    )
+    parser.add_argument(
+        "--openalex-min-interval-seconds",
+        type=float,
+        default=OPENALEX_DEFAULT_MIN_INTERVAL_SECONDS,
+        help="Minimum interval between OpenAlex requests in seconds (default: 1.2).",
+    )
+    parser.add_argument(
+        "--openalex-jitter-seconds",
+        type=float,
+        default=OPENALEX_DEFAULT_JITTER_SECONDS,
+        help="Random jitter added before OpenAlex requests in seconds (default: 0.3).",
+    )
+    parser.add_argument(
+        "--openalex-max-wait-seconds",
+        type=float,
+        default=OPENALEX_DEFAULT_MAX_WAIT_SECONDS,
+        help="Maximum wait per OpenAlex retry in seconds (default: 90.0).",
+    )
+    parser.add_argument(
         "--s2-api-key",
         type=str,
         default="",
@@ -899,20 +1124,58 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="How many top contributing papers to store in debug columns.",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose debug output with detailed printf statements.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from checkpoint if available.",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        type=Path,
+        default=None,
+        help=(
+            "Checkpoint filename. The file is always saved inside <output-dir> "
+            "(default name: online_referee_checkpoint.json)."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    verbose = args.verbose
+    if verbose:
+        print("[DEBUG] Verbose mode enabled")
     sources = parse_sources(args.sources)
     s2_api_key = args.s2_api_key.strip() or os.getenv("S2_API_KEY", "").strip()
     effective_max_works = None if args.full_scan else max(1, int(args.max_works))
+    openalex_max_retries = max(0, int(args.openalex_max_retries))
+    openalex_backoff_seconds = max(0.1, float(args.openalex_backoff_seconds))
+    openalex_min_interval_seconds = max(0.0, float(args.openalex_min_interval_seconds))
+    openalex_jitter_seconds = max(0.0, float(args.openalex_jitter_seconds))
+    openalex_max_wait_seconds = max(1.0, float(args.openalex_max_wait_seconds))
+    if verbose:
+        print(f"[DEBUG] Sources: {sources}, max_works: {effective_max_works}")
 
     base_dir = args.base_dir.resolve()
     project_dir = (args.project_dir or (base_dir / "data" / "project")).resolve()
     candidates_csv = (args.candidates_csv or (base_dir / "data" / "candidates.csv")).resolve()
     output_dir = (args.output_dir or (base_dir / "output")).resolve()
     conflicts_file = (args.conflicts_file or (base_dir / "data" / "project" / "conflicts.yaml")).resolve()
+    checkpoint_name = (args.checkpoint_file.name if args.checkpoint_file else "online_referee_checkpoint.json")
+    checkpoint_file = (output_dir / checkpoint_name).resolve()
+
+    if args.checkpoint_file and args.checkpoint_file.parent not in {Path("."), Path("")}:
+        print(
+            "[INFO] --checkpoint-file path normalized to output directory; "
+            f"using: {checkpoint_file}"
+        )
 
     if not project_dir.exists():
         raise FileNotFoundError(f"Project directory not found: {project_dir}")
@@ -982,6 +1245,8 @@ def main() -> None:
 
     candidates = load_online_candidates(candidates_csv, project_pes=project_pes)
     print(f"[INFO] Candidates after PE pre-filter ({','.join(inferred_pes)}): {len(candidates)}")
+    if verbose:
+        print(f"[DEBUG] First 3 candidates: {[c.name for c in candidates[:3]]}")
     if not candidates:
         raise ValueError(f"No candidates found with PE overlap in {','.join(inferred_pes)}")
 
@@ -989,10 +1254,74 @@ def main() -> None:
         print("[INFO] Work scan mode: full-scan (no max limit per candidate/source)")
     else:
         print(f"[INFO] Work scan mode: capped (max_works={effective_max_works} per candidate/source)")
+    if "openalex" in sources:
+        print(
+            "[INFO] OpenAlex rate control: "
+            f"min_interval={openalex_min_interval_seconds:.2f}s, "
+            f"jitter<= {openalex_jitter_seconds:.2f}s, "
+            f"max_retries={openalex_max_retries}, "
+            f"backoff={openalex_backoff_seconds:.1f}s, "
+            f"max_wait={openalex_max_wait_seconds:.1f}s"
+        )
+        if not args.openalex_mailto.strip():
+            print(
+                "[WARN] --openalex-mailto not set: OpenAlex may apply stricter limits and return more 429 responses."
+            )
+
+    run_signature = build_run_signature(
+        project_dir=project_dir,
+        candidates_csv=candidates_csv,
+        conflicts_file=conflicts_file,
+        sources=sources,
+        args=args,
+        inferred_pes=inferred_pes,
+    )
+
+    checkpoint_state = init_checkpoint_state(run_signature)
+    if args.resume:
+        loaded_checkpoint = load_checkpoint(checkpoint_file)
+        if loaded_checkpoint is None:
+            print(f"[INFO] Resume requested but checkpoint not found: {checkpoint_file}. Starting fresh.")
+        else:
+            saved_signature = loaded_checkpoint.get("run_signature") or {}
+            if not isinstance(saved_signature, dict):
+                raise ValueError("Invalid checkpoint: run_signature is not an object")
+
+            compatibility_issues = signature_compatibility_issues(saved_signature, run_signature)
+            if compatibility_issues:
+                preview = "; ".join(compatibility_issues[:3])
+                raise ValueError(
+                    "Checkpoint run signature mismatch on required fields. "
+                    f"Examples: {preview}. "
+                    "Use the same core input parameters/files or choose a different checkpoint filename."
+                )
+            checkpoint_state = loaded_checkpoint
+
+            # Upgrade checkpoint signature to include any newly introduced optional keys.
+            checkpoint_state["run_signature"] = run_signature
+            print(
+                f"[INFO] Loaded checkpoint: processed={len(checkpoint_state.get('processed_candidate_ids', []))}, "
+                f"skipped={len(checkpoint_state.get('skipped_candidate_ids', []))}, "
+                f"rows={len(checkpoint_state.get('rows', []))}"
+            )
+    elif checkpoint_file.exists():
+        print(f"[INFO] Existing checkpoint ignored (fresh run): {checkpoint_file}")
 
     rules = load_conflict_rules(conflicts_file)
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = [
+        row for row in checkpoint_state.get("rows", []) if isinstance(row, dict)
+    ]
+    processed_candidate_ids: set[str] = {
+        str(item).strip()
+        for item in checkpoint_state.get("processed_candidate_ids", [])
+        if str(item).strip()
+    }
+    skipped_candidate_ids: set[str] = {
+        str(item).strip()
+        for item in checkpoint_state.get("skipped_candidate_ids", [])
+        if str(item).strip()
+    }
     focus_weight = min(max(args.focus_weight, 0.0), 1.0)
     profile_weight = 1.0 - focus_weight
     focus_top_k = max(1, int(args.focus_top_k))
@@ -1003,10 +1332,14 @@ def main() -> None:
     )
 
     for idx, candidate in enumerate(candidates, start=1):
-        print(
-            f"[INFO] Analyzing candidate {idx}/{len(candidates)}: "
-            f"{candidate.candidate_id} | {candidate.name}"
-        )
+        if candidate.candidate_id in processed_candidate_ids or candidate.candidate_id in skipped_candidate_ids:
+            print(
+                f"[INFO] Resume skip candidate {idx}/{len(candidates)}: "
+                f"{candidate.candidate_id} | {candidate.name}"
+            )
+            continue
+
+        print(candidate.name)
         resolved_institution = candidate.institution
         resolved_h_index: int | None = None
 
@@ -1024,11 +1357,20 @@ def main() -> None:
 
         if "openalex" in sources:
             try:
+                if verbose:
+                    print(f"[DEBUG] Resolving OpenAlex author for {candidate.name}")
                 author_id, resolved_institution, resolved_h_index = resolve_openalex_author_id(
                     candidate,
                     mailto=args.openalex_mailto,
+                    openalex_max_retries=openalex_max_retries,
+                    openalex_backoff_seconds=openalex_backoff_seconds,
+                    openalex_min_interval_seconds=openalex_min_interval_seconds,
+                    openalex_jitter_seconds=openalex_jitter_seconds,
+                    openalex_max_wait_seconds=openalex_max_wait_seconds,
                 )
                 openalex_author_id = author_id
+                if verbose:
+                    print(f"[DEBUG] OpenAlex ID: {author_id}, h-index: {resolved_h_index}")
                 (
                     oa_vec,
                     oa_works,
@@ -1047,6 +1389,11 @@ def main() -> None:
                     from_year=args.from_year,
                     max_works=effective_max_works,
                     sleep_seconds=args.sleep_seconds,
+                    openalex_max_retries=openalex_max_retries,
+                    openalex_backoff_seconds=openalex_backoff_seconds,
+                    openalex_min_interval_seconds=openalex_min_interval_seconds,
+                    openalex_jitter_seconds=openalex_jitter_seconds,
+                    openalex_max_wait_seconds=openalex_max_wait_seconds,
                 )
                 aggregate_vec = oa_vec if aggregate_vec is None else (aggregate_vec + oa_vec)
                 works_total += oa_works
@@ -1060,6 +1407,12 @@ def main() -> None:
                 print(
                     f"[WARN] OpenAlex author not found for candidate "
                     f"{candidate.candidate_id} ({candidate.name})."
+                )
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "?"
+                print(
+                    f"[WARN] OpenAlex skipped for candidate {candidate.candidate_id} "
+                    f"({candidate.name}) due to HTTP {status_code}"
                 )
 
         if "semanticscholar" in sources:
@@ -1108,6 +1461,11 @@ def main() -> None:
                 f"[WARN] Candidate skipped (no source data available): "
                 f"{candidate.candidate_id} | {candidate.name}"
             )
+            skipped_candidate_ids.add(candidate.candidate_id)
+            checkpoint_state["skipped_candidate_ids"] = sorted(skipped_candidate_ids)
+            checkpoint_state["processed_candidate_ids"] = sorted(processed_candidate_ids)
+            checkpoint_state["rows"] = rows
+            save_checkpoint(checkpoint_file, checkpoint_state)
             continue
 
         aggregate_vec = normalize(aggregate_vec, norm="l2")
@@ -1118,9 +1476,12 @@ def main() -> None:
             ml_score = lexical_ml_score
         else:
             ml_score = lexical_weight * lexical_ml_score + embedding_weight * embedding_ml_score
-
+        if verbose:
+            print(f"[DEBUG] ML Score - lexical: {lexical_ml_score:.4f}, embedding: {embedding_ml_score}, final: {ml_score:.4f}")
         focus_score = compute_focus_score(candidate_selected_affinities, top_k=focus_top_k)
         final_score = profile_weight * ml_score + focus_weight * focus_score
+        if verbose:
+            print(f"[DEBUG] Focus score: {focus_score:.4f}, final score: {final_score:.4f}")
         debug_focus_top = top_debug_entries(candidate_debug_rows, top_n=debug_top_n)
 
         profile = MinimalConflictProfile(
@@ -1132,6 +1493,8 @@ def main() -> None:
         )
         reasons = conflict_reasons(profile, rules)
         is_conflict = len(reasons) > 0
+        if verbose:
+            print(f"[DEBUG] Conflict analysis: is_conflict={is_conflict}, reasons={reasons}")
         eligible = (not is_conflict) if args.conflict_mode == "exclude" else True
 
         rows.append(
@@ -1157,18 +1520,25 @@ def main() -> None:
                 "conflict_reasons": " | ".join(reasons),
             }
         )
-        print(
-            f"[INFO] Candidate done: {candidate.candidate_id} | "
-            f"ml_score={ml_score:.4f}, focus_score={focus_score:.4f}, "
-            f"final_score={final_score:.4f}, eligible={eligible}"
-        )
+        processed_candidate_ids.add(candidate.candidate_id)
+        checkpoint_state["skipped_candidate_ids"] = sorted(skipped_candidate_ids)
+        checkpoint_state["processed_candidate_ids"] = sorted(processed_candidate_ids)
+        checkpoint_state["rows"] = rows
+        save_checkpoint(checkpoint_file, checkpoint_state)
+        print(candidate.name)
 
     ranking = pd.DataFrame(rows)
+    if verbose:
+        print(f"[DEBUG] Created DataFrame with {len(ranking)} candidates")
     if ranking.empty:
         raise ValueError("No candidates processed")
 
     ranking = ranking.sort_values(by=["eligible", "final_score"], ascending=[False, False]).reset_index(drop=True)
     ranking["rank"] = np.arange(1, len(ranking) + 1)
+    if verbose:
+        print(f"[DEBUG] Top 3 eligible candidates (by final_score): ")
+        for _, row in ranking[ranking["eligible"]].head(3).iterrows():
+            print(f"[DEBUG]   Rank {row['rank']}: {row['name']} (score={row['final_score']:.4f})")
     ranking = ranking[
         [
             "rank",
@@ -1201,9 +1571,19 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "online_referee_ranking.csv"
     md_path = output_dir / "online_referee_ranking.md"
+    if verbose:
+        print(f"[DEBUG] Saving CSV to: {csv_path}")
+        print(f"[DEBUG] Saving Markdown to: {md_path}")
 
     ranking.to_csv(csv_path, index=False)
     write_markdown_report(md_path, ranking, project_doc_count)
+    checkpoint_state["completed"] = True
+    checkpoint_state["rows"] = rows
+    checkpoint_state["processed_candidate_ids"] = sorted(processed_candidate_ids)
+    checkpoint_state["skipped_candidate_ids"] = sorted(skipped_candidate_ids)
+    save_checkpoint(checkpoint_file, checkpoint_state)
+    if verbose:
+        print(f"[DEBUG] Files saved successfully")
 
     winner = eligible.iloc[0]
     print("=== Recommended Referee (Online Streaming) ===")
@@ -1212,6 +1592,7 @@ def main() -> None:
     print(f"Final score: {winner['final_score']:.4f}")
     print(f"ML score: {winner['ml_score']:.4f}")
     print(f"Candidates in conflict: {int(ranking['is_conflict'].sum())}")
+    print(f"Checkpoint: {checkpoint_file}")
     print()
     print(f"Ranking CSV: {csv_path}")
     print(f"Report Markdown: {md_path}")
